@@ -5,7 +5,21 @@ from folder_paths import get_full_path, get_folder_paths, models_dir
 import os
 import torch.nn.functional as F
 import gc
- 
+from torch.cuda.amp import autocast
+import psutil
+
+def print_memory_stats():
+    """Print current memory usage statistics"""
+    if torch.cuda.is_available():
+        gpu_memory_allocated = torch.cuda.memory_allocated() / (1024**3)
+        gpu_memory_cached = torch.cuda.memory_reserved() / (1024**3)
+        print(f"GPU Memory allocated: {gpu_memory_allocated:.2f} GB")
+        print(f"GPU Memory cached: {gpu_memory_cached:.2f} GB")
+    
+    process = psutil.Process(os.getpid())
+    ram_usage = process.memory_info().rss / (1024**3)
+    print(f"RAM Usage: {ram_usage:.2f} GB")
+
 def split_tensor_into_batches(tensor, batch_size):
     """
     Split a tensor into smaller batches of specified size with memory optimization
@@ -39,6 +53,12 @@ def split_tensor_into_batches(tensor, batch_size):
     
     return batch_indices
 
+def cleanup_memory():
+    """Cleanup GPU and CPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
 
 class LoadInvSRModels:
     @classmethod
@@ -58,41 +78,48 @@ class LoadInvSRModels:
     CATEGORY = "INVSR"
 
     def loadmodel(self, sd_model, invsr_model, dtype, tiled_vae):
-        match dtype:
-            case "fp16":
-                dtype = "torch.float16"
-            case "fp32":
-                dtype = "torch.float32"
-            case "bf16":
-                dtype = "torch.bfloat16"
-
-        cfg_path = os.path.join(
-            os.path.dirname(__file__), "configs", "sample-sd-turbo.yaml"
-        )
-        sd_path = get_folder_paths("diffusers")[0]
-
         try:
-            ckpt_dir = get_folder_paths("invsr")[0]
-        except:
-            ckpt_dir = os.path.join(models_dir, "invsr")
+            match dtype:
+                case "fp16":
+                    dtype = "torch.float16"
+                case "fp32":
+                    dtype = "torch.float32"
+                case "bf16":
+                    dtype = "torch.bfloat16"
 
-        args = Namespace(
-            bs=1,
-            chopping_bs=8,
-            timesteps=None,
-            num_steps=1,
-            cfg_path=cfg_path,
-            sd_path=sd_path,
-            started_ckpt_dir=ckpt_dir,
-            tiled_vae=tiled_vae,
-            color_fix="",
-            chopping_size=128,
-        )
-        configs = get_configs(args)
-        configs["sd_pipe"]["params"]["torch_dtype"] = dtype
-        base_sampler = BaseSampler(configs)
+            cfg_path = os.path.join(
+                os.path.dirname(__file__), "configs", "sample-sd-turbo.yaml"
+            )
+            sd_path = get_folder_paths("diffusers")[0]
 
-        return (base_sampler,)
+            try:
+                ckpt_dir = get_folder_paths("invsr")[0]
+            except:
+                ckpt_dir = os.path.join(models_dir, "invsr")
+
+            args = Namespace(
+                bs=1,
+                chopping_bs=8,
+                timesteps=None,
+                num_steps=1,
+                cfg_path=cfg_path,
+                sd_path=sd_path,
+                started_ckpt_dir=ckpt_dir,
+                tiled_vae=tiled_vae,
+                color_fix="",
+                chopping_size=128,
+            )
+            configs = get_configs(args)
+            configs["sd_pipe"]["params"]["torch_dtype"] = dtype
+            
+            with torch.no_grad():
+                base_sampler = BaseSampler(configs)
+            
+            return (base_sampler,)
+            
+        except Exception as e:
+            cleanup_memory()
+            raise e
 
 class InvSRSampler:
     @classmethod
@@ -118,6 +145,7 @@ class InvSRSampler:
 
     def process(self, invsr_pipe, images, num_steps, cfg, batch_size, chopping_batch_size, chopping_size, color_fix, seed):
         try:
+            print_memory_stats()
             base_sampler = invsr_pipe
             if color_fix == "none":
                 color_fix = ""
@@ -151,47 +179,51 @@ class InvSRSampler:
             base_sampler.setup_seed(seed)
             sampler = InvSamplerSR(base_sampler)
 
-            images_bchw = images.permute(0,3,1,2)
-            og_h, og_w = images_bchw.shape[2:]
+            # Move input to device and process
+            with torch.no_grad(), autocast(enabled=True):
+                images_bchw = images.permute(0,3,1,2)
+                og_h, og_w = images_bchw.shape[2:]
 
-            # Calculate new dimensions divisible by 16
-            new_height = ((og_h + 15) // 16) * 16
-            new_width = ((og_w + 15) // 16) * 16
-            resized = False
-            
-            if og_h != new_height or og_w != new_width:
-                resized = True
-                print(f"[InvSR] - Image not divisible by 16. Resizing to {new_height} (h) x {new_width} (w)")
-                images_bchw = F.interpolate(images_bchw, size=(new_height, new_width), mode='bicubic', align_corners=False)
-
-            batch_indices = split_tensor_into_batches(images_bchw, batch_size)
-            results = []
-            pbar = ProgressBar(len(batch_indices))
-
-            for start_idx, end_idx in batch_indices:
-                # Process batch
-                batch = images_bchw[start_idx:end_idx]
-                result = sampler.inference(image_bchw=batch)
-                results.append(torch.from_numpy(result))
-                pbar.update(1)
+                # Calculate new dimensions divisible by 16
+                new_height = ((og_h + 15) // 16) * 16
+                new_width = ((og_w + 15) // 16) * 16
+                resized = False
                 
-                # Clear GPU cache after each batch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
+                if og_h != new_height or og_w != new_width:
+                    resized = True
+                    print(f"[InvSR] - Image not divisible by 16. Resizing to {new_height} (h) x {new_width} (w)")
+                    images_bchw = F.interpolate(images_bchw, size=(new_height, new_width), mode='bicubic', align_corners=False)
 
-            # Concatenate results and handle final processing
-            result_t = torch.cat(results, dim=0)
+                batch_indices = split_tensor_into_batches(images_bchw, batch_size)
+                results = []
+                pbar = ProgressBar(len(batch_indices))
 
-            # Resize to original dimensions * 4 if needed
-            if resized:
-                result_t = F.interpolate(result_t, size=(og_h * 4, og_w * 4), mode='bicubic', align_corners=False)
-            
-            return (result_t.permute(0,2,3,1),)
+                for start_idx, end_idx in batch_indices:
+                    # Process batch
+                    batch = images_bchw[start_idx:end_idx].contiguous()
+                    result = sampler.inference(image_bchw=batch)
+                    results.append(torch.from_numpy(result))
+                    pbar.update(1)
+                    
+                    cleanup_memory()
+                    print_memory_stats()
+
+                # Concatenate results efficiently
+                result_t = torch.cat(results, dim=0)
+                del results
+                cleanup_memory()
+
+                # Resize to original dimensions * 4 if needed
+                if resized:
+                    result_t = F.interpolate(result_t, size=(og_h * 4, og_w * 4), mode='bicubic', align_corners=False)
+                
+                final_result = result_t.permute(0,2,3,1)
+                del result_t
+                cleanup_memory()
+                
+                print_memory_stats()
+                return (final_result,)
 
         except Exception as e:
-            # Clean up in case of error
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            cleanup_memory()
             raise e
