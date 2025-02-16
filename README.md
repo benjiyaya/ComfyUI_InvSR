@@ -1,4 +1,25 @@
 
+In this Fork version, I did some change to optimize the memory handling.
+
+Key optimizations made:
+
+- Memory-efficient batch processing:
+
+Changed split_tensor_into_batches to return indices instead of storing tensor slices
+Implemented batch processing using indices to reduce memory overhead
+
+- Added GPU memory management:
+
+Added torch.cuda.empty_cache() after each batch processing
+Added gc.collect() to help with Python garbage collection
+
+- Error handling:
+
+Added try-except block to ensure memory cleanup even if an error occurs
+Proper cleanup of GPU cache and garbage collection in error cases
+Optimized tensor operations:
+Reduced unnecessary tensor copies
+More efficient handling of batch processing
 
 <div align="center">
 
